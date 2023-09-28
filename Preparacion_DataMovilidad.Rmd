@@ -1,0 +1,162 @@
+---
+title: "Preparacion_DataMovilidad"
+author: "Dario Espinoza"
+date: "2023-09-08"
+output: html_document
+---
+
+## Preparación de Data de Movilidad
+
+Cargar los datasets de movilidad, "tripdata" y "subdata", convertir cada tupla a objetos espaciales y conservar los que se encuentren dentro del área urbana de la ciudad de Cuenca.
+
+# Librerias usadas
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if(!require(dplyr)){install.packages("dplyr")} else {library(dplyr)}
+if(!require(sf)){install.packages("sf")} else {library(sf)}
+
+```
+
+# Cargar datos de movilidad
+
+```{r cars}
+# Cargar datasets
+load("datamovilidad/tripdata.R")
+load("datamovilidad/subdata.R")
+
+# Establecer variables tipo factor
+tripdata$wday <- factor(tripdata$wday, 
+                        levels = c(1,2,3,4,5,6,7), 
+                        labels = c("Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"))
+tripdata$mode <- factor(tripdata$mode, 
+                        levels = c("in_vehicle", "on_bicycle", "on_foot", "running", "still", "walking"),
+                        labels = c("en_vehiculo", "en_bicicleta", "a_pie", "corriendo", "parado", "caminando"))
+subdata$activity_type <- factor(subdata$activity_type, 
+                        levels = c("still", "walking", "in_vehicle", "on_bicycle", "running", "on_foot" ),
+                        labels = c("parado", "caminando", "en_vehiculo", "en_bicleta", "corriendo", "a_pie"))
+
+# Seleccionar variables
+# Variables descartadas en subdata: device_model(repetitiva), battery_level(no informativa)
+subdata <- subdata %>% select(-c("device_model", "battery_level"))
+# Variables descartadas en tripdata: ox, oy, dx, dy ya que se usara las coordenadas en latitud longitud
+tripdata <- tripdata %>% select(-c("ox", "oy", "dx", "dy"))
+```
+
+# Visualizar datos de movilidad
+
+Los datos de movilidad incluyen viajes dentro y fuera del pais, una de las primeras acciones es filtrar los datos contenidos dentro del area urbana de Cuenca
+
+```{r}
+# Cargar mapa Cuenca Urbano y Buffer que cubre Estacion Automatica de Monitoreo EMOV
+# Transformar CRS 
+#   [WGS 84 / UTM zone 17S coordenadas EPSG:32717 X e Y] a [WGS 84 / EPSG:4326 coordenadas Longitud y Latitud]
+cuenca_urb <- st_read("LIMITES_CUENCA_URBANO/cuenca.shp")
+cuenca_urb <- st_transform(cuenca_urb, 4326)
+
+# Convertir coordenadas de Subdata y Tripdata a puntos espaciales
+points_subdata <- st_as_sf(x = subdata, 
+                  coords = c("longitude", "latitude"),
+                  crs = st_crs(cuenca_urb))
+points_tripdata_orig <- st_as_sf(x = tripdata, 
+                  coords = c("olong", "olat"),
+                  crs = st_crs(cuenca_urb))
+points_tripdata_dest <- st_as_sf(x = tripdata, 
+                  coords = c("dlong", "dlat"),
+                  crs = st_crs(cuenca_urb))
+
+
+# Mostrar con plot, solo puntos cercanos al area urbana de Cuenca
+# SIN EMBARGO al visualizar en QGIS se puede ver que hay puntos fuera de Ecuador
+plot(cuenca_urb$geometry, main="Limite Urbano Cuenca, Subdata (Verde), Tripdata(Naranja-Rojo)")
+plot(points_subdata$geometry, pch=1, col="green", add=TRUE)
+plot(points_tripdata_orig$geometry, pch=1, col="orange", add=TRUE)
+plot(points_tripdata_dest$geometry, pch=1, col="red", add=TRUE)
+```
+
+# Delimitar los viajes a los que se encuentren dentro del área urbana de Cuenca
+
+Iterar con cada uno de los viajes, conservar aquellos cuyo inicio, final, y puntos registrados esten dentro del área urbana de Cuenca
+
+```{r}
+# tripdata_inside Cuenca Urbano
+# Viajes que se han realizado dentro del radio de accion de la estacion de monitoreo
+# Preparar un dataset vacio para agregar los puntos que se encuentran dentro del viaje
+tripdata_ins_cu <- matrix(nrow = 0, ncol = ncol(tripdata))
+tripdata_ins_cu <- data.frame(tripdata_ins_cu)
+names(tripdata_ins_cu) <- names(tripdata)
+# subdata_inside Cuenca Urbano
+subdata_ins_cu <- matrix(nrow = 0, ncol = ncol(subdata))
+subdata_ins_cu <- data.frame(subdata_ins_cu)
+names(subdata_ins_cu) <- names(subdata)
+
+# Hacer un loop
+start_time <- Sys.time()
+# Analizar todos los viajes disponibles y sus detalles en subdata
+for (myrow in 1:nrow(tripdata)) {
+  # Obtener datos para consultar detalle de viaje
+  row_trip <- tripdata[myrow, ]
+
+  # Obtener detalle de viaje de subdata
+  rows_subd <- subdata %>% filter(recorded_at >= row_trip$starttime & 
+                                recorded_at <= row_trip$endtime & 
+                                company_token == row_trip$user)
+  
+  # Si existen datos de viaje en subdata, verificar que esten dentro del area urbana
+  # PRIMERA LIMPIEZA DE DATOS
+  if (nrow(rows_subd) > 0){
+    # Convertir datasets a un sf object
+    points_usr <- st_as_sf(x = rows_subd, 
+                      coords = c("longitude", "latitude"),
+                      crs = st_crs(cuenca_urb))
+    point_org <- st_as_sf(x = row_trip, 
+                      coords = c("olong", "olat"),
+                      crs = st_crs(cuenca_urb))
+    point_dst <- st_as_sf(x = row_trip, 
+                      coords = c("dlong", "dlat"),
+                      crs = st_crs(cuenca_urb))
+    
+    # Verificar si los puntos se encuentran dentro del poligono de Cuenca Urbano
+    ins_cuenca <- lengths(st_intersects(points_usr, cuenca_urb)) > 0
+    org_ins_cuenca <- lengths(st_intersects(point_org, cuenca_urb)) > 0
+    dst_ins_cuenca <- lengths(st_intersects(point_dst, cuenca_urb)) > 0
+    
+    # Conservar el viaje, si todos los puntos del viaje estan dentro de la estacion
+    if (sum(ins_cuenca) == nrow(rows_subd) &
+        sum(org_ins_cuenca) == 1 &
+        sum(dst_ins_cuenca) == 1){
+      tripdata_ins_cu <- rbind(tripdata_ins_cu, tripdata[myrow,])
+      subdata_ins_cu <- rbind(subdata_ins_cu, rows_subd)
+    }
+  }
+}
+# Fin de ejecucion
+end_time <- Sys.time()
+# Tiempo de ejecucion
+print(end_time - start_time)
+
+# Guardar los datos filtrados en un csv
+write.csv(tripdata_ins_cu, 'tripdata_ins_cu.csv', row.names = T)
+write.csv(subdata_ins_cu, 'subdata_ins_cu.csv', row.names = T)
+
+# Mostrar los datos filtrados
+points_subdata <- st_as_sf(x = subdata_ins_cu, 
+                  coords = c("longitude", "latitude"),
+                  crs = st_crs(cuenca_urb))
+points_tripdata_orig <- st_as_sf(x = tripdata_ins_cu, 
+                  coords = c("dlong", "dlat"),
+                  crs = st_crs(cuenca_urb))
+points_tripdata_dest <- st_as_sf(x = tripdata_ins_cu, 
+                  coords = c("olong", "olat"),
+                  crs = st_crs(cuenca_urb))
+# Plot
+start_time <- Sys.time()
+plot(cuenca_urb$geometry)
+plot(points_subdata$geometry, pch=1, col="green", add=TRUE)
+plot(points_tripdata_orig$geometry, pch=1, col="yellow", add=TRUE)
+plot(points_tripdata_dest$geometry, pch=1, col="red", add=TRUE)
+end_time <- Sys.time()
+# Tiempo de ejecucion
+print(end_time - start_time)
+```
+
